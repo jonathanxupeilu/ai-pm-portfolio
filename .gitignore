@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+env/
+
+# 编辑器与系统
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+
+# ---- 个人数据（本仓库只放格式说明与脱敏示例）----
+# 真实岗位池与投递台账
+jd-pool/green/
+jd-pool/yellow/
+jd-pool/red/
+jd-pool/archive/
+jd-pool/.link_cache.json
+jd-pool/RANKED_LIST.md
+jd-pool/SKILL_RADAR.md
+jd-pool/KEYWORD_MINING.md
+jd-pool/coach_feed.md
+
+# 真实简历与派生稿（仅保留 README 与虚构示例）
+resumes/*.html
+resumes/*.md
+!resumes/README.md
+!resumes/示例_母版.md
+
+# 个人训练记录（仅保留空白模板）
+progress/*.bak
+progress/*.local.md
+
+# 抓取缓存与临时产物
+*.local.*
+_tmp_*.py
+_build_stage*.py
