@@ -90,7 +90,7 @@
 │   ├── scripts/                    打分 / 排序 / 关键词挖掘 / 池清理 / ATS 自检
 │   ├── templates/                  五套企业类型简历模板 + 母版骨架
 │   ├── evals/                      简历引用核查与评测集
-│   ├── references/                 方法论文档
+│   ├── references/                 方法论文档  ⚠️【仓库版已剔除】脱敏时整目录剔除，仓库内不存在（SKILL.md 中相关引用已同步标注）
 │   ├── resumes/                    母版结构与派生机制说明（示例为虚构样本）
 │   └── jd-pool/                    岗位池格式说明 + 脱敏示例
 │
@@ -102,6 +102,8 @@
 ```
 
 **关于隐私**：真实简历、岗位池明细、投递台账与个人训练记录均不入库。仓库内 `resumes/` 与 `jd-pool/examples/` 使用的是虚构或脱敏样本。
+
+排除规则全部用递归写法（`**/resumes/*.md`、`**/jd-pool/green/` 等）覆盖嵌套技能目录——写成根锚定形式（`resumes/*.md`）对 `01-job-application-copilot/resumes/` 是不生效的，这点用 `git check-ignore -v` 实测过。个人实盘数据统一用 `*.local.*` 后缀命名，同样已被忽略。
 
 ---
 

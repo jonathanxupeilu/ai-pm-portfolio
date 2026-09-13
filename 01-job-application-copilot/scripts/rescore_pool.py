@@ -129,6 +129,10 @@ def main():
             continue
         # 打分剔除【人工复核备注】：那是 AI 批注，不是 JD 原文
         text = exc.group(1).split("【人工复核备注】")[0]
+        # 2026-09-11：再剥引导元数据（猎聘管道写在摘录块头部的 投递入口/地点/薪资 行），
+        # 与 match_jd.jd_body 口径完全对齐——否则「地点：…上海…招聘」页面标题会骗过
+        # 城市规则的「正文含上海即放过」保护（宁波银行投研方向漏判红的根因）。
+        text = M._strip_leading_meta(text)
         # 完整性闸门**重判**（2026-09-10）：必须基于当前正文重新过闸。
         # 补录完只把 truncated 改回 0 是不够的——那等于补录脚本给自己发合格证，
         # 得让闸门自己宣布「现在完整了」才算真修好。
@@ -151,7 +155,7 @@ def main():
 
         new_tier = eff_tier
         if args.recheck_gate:
-            gate, _ = M.hard_gate(text)
+            gate, _ = M.hard_gate(text, meta_text=M._leading_meta(raw), title=meta.get("title", ""))
             new_tier = gate or "green"
             if new_tier != eff_tier:
                 tier_change.append((f, eff_tier, new_tier))

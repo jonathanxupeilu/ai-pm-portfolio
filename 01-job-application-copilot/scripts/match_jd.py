@@ -114,9 +114,21 @@ def extract_pm_years(text: str):
     return results[0][0], [r[1] for r in results]
 
 
-def hard_gate(text: str):
-    """硬门槛判定。返回 (verdict, findings)，verdict: red/yellow/None"""
+def hard_gate(text: str, meta_text: str = "", title: str = ""):
+    """硬门槛判定。返回 (verdict, findings)，verdict: red/yellow/None
+
+    2026-09-11 修（规则短路）：原实现每条规则命中即 `return`，而规则1（PM 年限）在绝大多数 JD 上
+    都会先命中 → 后面的年龄红线 / 院校硬卡 / 城市 三条规则**根本不会被执行**。
+    实测：中铁上海院 JD 明写「年龄不超过35岁」（候选人 37 岁），却因规则1 先返回 yellow 而被放过。
+    SKILL.md 明写硬门槛是「任一命中即否决」，故改为**累积所有命中**、最后取最严者（red > yellow）。
+    """
     findings = []
+    verdict = None
+
+    def _raise(v):
+        nonlocal verdict
+        if v == "red" or verdict is None:
+            verdict = v
 
     # 规则1：PM 经验年限
     yrs, ev = extract_pm_years(text)
@@ -129,22 +141,33 @@ def hard_gate(text: str):
     if yrs >= 3 and alt_ok:
         findings.append(f"🟢 年限要求 {yrs} 年为『产品/算法/数据』多选或明确豁免PM年限，候选人 9 年算法背景满足 ｜ 证据：{ev[0]}")
     elif yrs >= 3:
-        hard_hit = re.search(r"(必须|不低于|至少|优先考虑具有|要求)", text) and any(("必须" in w or "要求" in w or "至少" in w or "不低于" in w) for w in ev)
+        # 2026-09-11 修：原实现 `re.search(r"(必须|不低于|至少|优先考虑具有|要求)", text)` 扫**全文**，
+        # 而「任职要求 / 岗位要求 / 技能要求」这类段落标题的「要求」二字几乎每份 JD 都有 → 第一个条件恒真；
+        # 第二个条件在 ±30 字窗口内也极易撞到「技能要求」→ 结果「≥3 年但未写必须」被一律封红档。
+        # 实测误判 3 例：绿叶制药 / 某工业制造 / SHEIN（JD 只写「3 年以上产品经理经验」，无任何强性词）。
+        # 改为：只在**年限证据窗口内**认**强性词**，且要求强词与年限数字相邻（≤8 字），避免窗口边界串味。
+        HARD_WORD = r"(必须|不得低于|不低于|至少|硬性)"
+        hard_hit = any(
+            re.search(HARD_WORD + r"[^，。；、,;\n]{0,8}\d+\s*年", w)
+            or re.search(r"\d+\s*年[^，。；、,;\n]{0,10}(必须|硬性|不得低于)", w)
+            for w in ev
+        )
         if hard_hit:
             findings.append(f"🔴 PM相关经验 {yrs} 年且为硬性要求 → 一票否决 ｜ 证据：{ev[0]}")
-            return "red", findings
-        findings.append(f"🟡 PM相关经验 {yrs} 年（未明确写'必须'，需人工确认是否软要求）｜ 证据：{ev[0]}")
-        return "yellow", findings
+            _raise("red")
+        else:
+            findings.append(f"🟡 PM相关经验 {yrs} 年（未明确写'必须'，需人工确认是否软要求）｜ 证据：{ev[0]}")
+            _raise("yellow")
     elif yrs == 2:
         findings.append(f"🟡 要求 PM 经验 {yrs} 年，候选人正式 PM 年限不足 → 差距分析 + 曲线路径（内推/作品集）｜ 证据：{ev[0]}")
-        return "yellow", findings
+        _raise("yellow")
     if yrs == 0:
         findings.append("🟢 未检出明确的 PM 经验年限要求（或未与产品语境绑定）")
 
     # 规则2：学历硬卡（只有「必须/要求/硬性」与 985/211 绑定才算；「优先」是软偏好不算）
     if re.search(r"((必须|要求|硬性|严格)[^。；\n]{0,15}(985|211|双一流))|((985|211|双一流)[^。；\n]{0,15}(必须|硬性|严格))", text):
         findings.append("🔴 硬卡 985/211/双一流 院校（第一学历为天津商业大学）→ 一票否决")
-        return "red", findings
+        _raise("red")
     if re.search(r"(985|211|双一流)", text):
         findings.append("🟢 JD 提及 985/211 但仅作「优先」软偏好，非硬卡")
     else:
@@ -153,28 +176,82 @@ def hard_gate(text: str):
     # 规则3：AI 落地案例数量
     if re.search(r"(2|两|二)\s*个以上.{0,8}(AI|人工智能|大模型).{0,6}(落地|应用|案例|产品)", text):
         findings.append("🟡 要求 2 个以上 AI 落地案例 → 可论证项：投研系统 + infoScience 双案例，需作品集支撑")
-        return "yellow", findings
+        _raise("yellow")
 
     # 规则4：年龄红线（触发示例：某 JD 实录「年龄不超过 35 岁」）
-    # 出生年按 career-facts/profile.md 的真实值填写，下方为占位默认值
-    birth_year = 1990
+    # 出生年按 career-facts/profile.md 的真实值填写
+    # 2026-09-11 已按 career-facts/profile.md 同步为 1989（原为占位默认值 1990）
+    # 2026-09-11 二次修：弃用裸「XX岁以下」匹配——众安公司简介「服务逾3.5亿用户，
+    # 其中35岁以下的人群占比58%」曾被误读为年龄红线。必须带「年龄」语境或「周岁」。
+    birth_year = 1989
     age = datetime.date.today().year - birth_year
-    age_m = re.search(r"年龄不超过\s*(\d{2})\s*岁", text) or re.search(r"年龄[^。；\n]{0,6}(\d{2})\s*岁(?:以下|以内)", text) or re.search(r"(\d{2})\s*岁以下", text)
+    age_m = (re.search(r"年龄不超过\s*(\d{2})\s*岁", text)
+             or re.search(r"年龄[^。；\n]{0,6}(\d{2})\s*岁(?:以下|以内)", text)
+             or re.search(r"(\d{2})\s*周岁(?:以下|以内|及以下)", text))
     if age_m:
         limit = int(age_m.group(1))
         if limit < age:
             findings.append(f"🔴 年龄要求不超过 {limit} 岁，候选人年龄 {age} 岁 → 一票否决")
-            return "red", findings
-        findings.append(f"🟢 年龄要求 {limit} 岁内，候选人 {age} 岁满足")
+            _raise("red")
+        else:
+            findings.append(f"🟢 年龄要求 {limit} 岁内，候选人 {age} 岁满足")
 
-    # 规则5：城市（仅当 JD 文本明确写出非上海城市且无远程字样）
-    city_m = re.search(r"(工作地[点址]?[:：]\s*)?(北京|深圳|杭州|广州|成都|武汉|南京|苏州|西安|厦门|长沙|重庆|天津|青岛|郑州)", text)
-    if city_m and not re.search(r"远程|支持远程|可远程|弹性办公", text) and "上海" not in text:
-        findings.append(f"🔴 工作城市疑似非上海（检出：{city_m.group(2)}）且无远程字样 → 一票否决（请人工复核）")
-        return "red", findings
-    findings.append("🟢 城市检查通过（上海 / 未检出冲突城市 / 支持远程）")
+    # 规则5：城市（2026-09-11 二次修，用户裁定「严格执行：非上海且不支持远程不投」）
+    # 可靠数据源只有两个：
+    #   ① 元数据「- **地点**：…」——但猎聘来源写的是**页面标题**（含「招聘】」字样），
+    #     那是搜索词城市不是岗位工作地（宁波银行岗标题就写着「上海…招聘」），必须排除；
+    #   ② 正文显式「工作地点：X」（含「工作地点宁波市」这类无冒号紧邻写法）。
+    # 弃用旧版「扫正文裸城市词」：分支描述（如「在深圳设有分支机构」）会误报（众安干跑即中招）。
+    CITY = (r"(北京|深圳|杭州|广州|成都|武汉|南京|苏州|西安|厦门|长沙|重庆|天津|青岛|郑州"
+            r"|宁波|合肥|无锡|济南|福州|大连)")
+    remote_ok = bool(re.search(r"远程|弹性办公|混合办公", text + (meta_text or "")))
+    city_red = None
+    meta_m = re.search(r"\*\*(?:工作)?地点\*\*\s*[:：]\s*([^\n]{1,40})", meta_text or "")
+    if meta_m and "招聘】" not in meta_m.group(1):
+        loc = meta_m.group(1)
+        mc = re.search(CITY, loc)
+        if mc and "上海" not in loc:
+            city_red = f"元数据工作地点「{loc.strip()}」"
+    if not city_red:
+        bm = re.search(r"工作地[点址]\s*[:：]?\s*" + CITY, text)
+        if bm and "上海" not in text:
+            city_red = f"正文写明「工作地点…{bm.group(1)}」"
+    if city_red and not remote_ok:
+        findings.append(f"🔴 工作城市非上海且无远程字样（{city_red}）→ 一票否决")
+        _raise("red")
+    else:
+        findings.append("🟢 城市检查通过（上海 / 未检出冲突城市 / 支持远程 / 未写明）")
 
-    return None, findings
+    # 规则6：排除条件②「无 AI 含量的 PM 岗」（2026-09-11 新增）
+    # 依据 career-facts/profile.md §三「自动排除条件」②：JD 通篇不提大模型 / Agent / RAG → 排除。
+    # profile 曾标注「脚本暂无对应规则，目前只能人工判定」——本条即该待办的落地。
+    # 判据纪律：宁可漏检，不可误杀——
+    #   ① 命中任一 AI 词即算「有 AI 含量」，只要有一处就不封红；
+    #   ② JD 疑似截断时（完整性闸门判 truncated），AI 词可能随残文一起丢了，
+    #      降级 🟡 交人工，绝不把「没读到」当成「没有」（与完整性闸门的假阴性教训同源）。
+    #   ① 命中任一 AI 词即算「有 AI 含量」，只要有一处就不封红；
+    #      判据范围 = 正文 + 岗位名（2026-09-11 修）：岗位名是招聘方写的 AI 信号——
+    #      实测「AI Infra PM」正文只讲推理平台、无大模型/Agent 词，只扫正文会误杀。
+    ai_scan = text + "\n" + (title or "")
+    ai_cats = [c for c in AI_CONTENT_CATS
+               if any(re.search(p, ai_scan, re.I) for p in SOFT_KEYWORDS[c])]
+    ai_extra = next((p for p in AI_EXTRA if re.search(p, ai_scan, re.I)), None)
+    if ai_cats or ai_extra:
+        shown = "、".join(ai_cats[:5]) or ai_extra
+        in_body = bool(re.search(ai_extra or "", text, re.I)) or any(
+            re.search(p, text, re.I) for c in ai_cats for p in SOFT_KEYWORDS[c])
+        src = "" if (in_body or not title) else "（出自岗位名）"
+        findings.append(f"🟢 排除条件②：检出 AI 含量（{shown}{src}）")
+    else:
+        cpl, _ = completeness_check(text)
+        if cpl == "truncated":
+            findings.append("🟡 排除条件②：未检出 AI 词，但 JD 疑似截断 → 可能是残文丢词，需补录后复核")
+            _raise("yellow")
+        else:
+            findings.append("🔴 排除条件②：JD 通篇未提大模型 / Agent / RAG 等 AI 词 → 无 AI 含量的岗，排除")
+            _raise("red")
+
+    return verdict, findings
 
 
 # ── 完整性闸门（2026-09-10 新增）──────────────────────────────────────────
@@ -216,10 +293,46 @@ def jd_body(text: str) -> str:
 
     档案的正文在 `## JD 原文摘录` 的代码块内；原始 JD 文本则整篇即正文。
     两条路径统一走这里，保证「完整性判断」和「打分」看到的是同一份文本。
+
+    2026-09-11 新增：剥离摘录头部的**入库元数据**（投递入口/薪资/来源等）。
+    根因：抓取管道写入档案的元数据块会被逐字保进摘录，打分器把它当 JD 正文——
+    实测把「来源：猎聘 MCP 主动搜索」里的 MCP 当成了 JD 提及的「MCP 协议」技能点。
+    白名单标签精确匹配 + 只剥**引导块**（遇到第一行非元数据即停），
+    正文里真实出现的「- **薪资**：面议」类内容不受影响。
     """
     m = re.search(r"##\s*JD\s*原文[^\n]*\n\s*```[^\n]*\n(.*?)\n\s*```", text, re.S)
     body = m.group(1) if m else text
-    return body.split("【人工复核备注】")[0]
+    body = body.split("【人工复核备注】")[0]
+    return _strip_leading_meta(body)
+
+
+META_LABELS = ("投递入口", "薪资", "地点", "经验要求", "学历要求", "猎聘任职要求字段",
+               "来源", "URL", "档位", "匹配分", "轮次定位", "采集日期", "关键词覆盖")
+
+
+def _split_leading_meta(body: str):
+    """拆成 (元数据行块, 正文本体)。判定规则与 META_LABELS 白名单一致。"""
+    lines = body.split("\n")
+    i = 0
+    while i < len(lines):
+        s = lines[i].strip()
+        if (not s or s == "---" or s.startswith("<!--") or s.startswith("# ")
+                or (s.startswith("- **") and any(f"**{k}**" in s[:24] for k in META_LABELS))):
+            i += 1
+            continue
+        break
+    return "\n".join(x.strip() for x in lines[:i] if x.strip()), "\n".join(lines[i:])
+
+
+def _strip_leading_meta(body: str) -> str:
+    return _split_leading_meta(body)[1]
+
+
+def _leading_meta(raw: str) -> str:
+    """取档案「摘录代码块头部的入库元数据」原文（地点/薪资/来源等），供硬门槛读结构化信息。"""
+    m = re.search(r"##\s*JD\s*原文[^\n]*\n\s*```[^\n]*\n(.*?)\n\s*```", raw, re.S)
+    body = (m.group(1) if m else raw).split("【人工复核备注】")[0]
+    return _split_leading_meta(body)[0]
 
 
 def completeness_check(text: str):
@@ -360,6 +473,20 @@ SOFT_KEYWORDS = {
 # 词表来源：16 类为人工初版；2026-09-10 用 mine_keywords.py 对 35 份 JD 做词频挖掘后补 8 个高频
 # 且当时未覆盖的词（工具调用/知识库/工作流/架构/产品规划/转化/上线/迭代）。
 # 改词表 = 改尺子，改完必须跑 `python scripts/rescore_pool.py --apply` 全池重跑，否则新旧分混排。
+
+# ── 排除条件②「无 AI 含量的 PM 岗」判定词表（2026-09-11 新增）────────────
+# 依据 career-facts/profile.md §三「自动排除条件」②：JD 通篇不提大模型 / Agent / RAG → 排除。
+# profile 原文曾标注「脚本暂无对应规则，目前只能人工判定」，本表 + hard_gate 规则6 即该待办的落地。
+AI_CONTENT_CATS = (
+    "大模型/LLM", "RAG/检索增强", "Agent/编排", "Prompt工程",
+    "效果评测", "幻觉治理", "多模态", "Vibe Coding/AI编程",
+)
+# 兜底补充词：防止 JD 用词不在 SOFT_KEYWORDS 里（如只写「人工智能」「生成式」而不写「大模型」）。
+# 含裸词 `AI` —— 判据纪律是「宁可漏检，不可误杀」（与下线词表、完整性闸门同一条），
+# 只要文中出现过一次 AI 相关字样就算「有 AI 含量」，绝不因用词朴素而误杀 AI 岗。
+AI_EXTRA = [r"(?<![A-Za-z0-9])AI(?![A-Za-z0-9])", r"人工智能",
+            r"(?<![A-Za-z0-9])AIGC(?![A-Za-z0-9])", r"生成式",
+            r"机器学习", r"深度学习", r"(?<![A-Za-z0-9])NLP(?![A-Za-z0-9])", r"算法模型"]
 
 # ── 细粒度技能点（SKILL_ATOMS）──────────────────────────────────────
 # 为什么需要它：SOFT_KEYWORDS 的 18 个类目衡量的是「面的覆盖」——一个类目里任一
@@ -681,6 +808,16 @@ def soft_match(text: str):
     return hits, misses
 
 
+# 证据语料的排除名单（2026-09-11 修）：
+# tags.md 是「标签对照表」，其第一列是**与 SOFT_KEYWORDS 键名同形**的 18 个标准类目名
+# （如「多模态」「C端产品」「RAG/检索增强」）。一旦把它拼进 facts_text，**每个类目都会
+# 恒真命中**——匹配到的是表头，不是证据。后果：bidirectional_match 把所有「真缺口」
+# 误判成「可补缺口」，atom_coverage 同理，组版时会把用户并不具备的能力组装进简历。
+# 这是本技能最严重的事故形态（编造事实）。tags.md 的证据指针本就冗余于
+# experiences/projects/metrics 三册，排除它不损失任何真实证据。
+FACTS_EXCLUDE = {"tags.md"}
+
+
 def load_corpus(resume_path, facts_dir=FACTS_DIR):
     """加载简历侧语料：(简历文本, 事实库文本)。缺文件返回空串，不崩。"""
     rt = ""
@@ -691,7 +828,8 @@ def load_corpus(resume_path, facts_dir=FACTS_DIR):
     fd = pathlib.Path(facts_dir)
     if fd.is_dir():
         ft = "\n".join(f.read_text(encoding="utf-8", errors="replace")
-                       for f in sorted(fd.glob("*.md")))
+                       for f in sorted(fd.glob("*.md"))
+                       if f.name not in FACTS_EXCLUDE)
     return rt, ft
 
 
@@ -777,7 +915,7 @@ def main():
     #      分数越跑越高且不可复现。rescore_pool 一直只用摘录代码块，两边口径必须一致。
     text = jd_body(raw)
 
-    gate_verdict, findings = hard_gate(text)
+    gate_verdict, findings = hard_gate(text, meta_text=_leading_meta(raw), title=args.title)
     # 完整性闸门先跑：JD 若是被抓残的，后面算出来的缺口数一律视为「未探明」
     comp_level, comp_reasons = completeness_check(raw)
 

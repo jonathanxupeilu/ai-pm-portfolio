@@ -175,12 +175,132 @@ def test_completeness():
     check("正文过短 → truncated", M.completeness_check(short)[0] == "truncated")
 
 
+# ── 8. 排除条件②：无 AI 含量的 PM 岗（2026-09-11 新增） ────────────────
+def test_ai_content_gate():
+    print("\n[8] 排除条件②（无 AI 含量 → 排除；截断时不武断封红）")
+    # 正文须 >300 字符，否则先被完整性闸门判 truncated → 规则6 会降级黄档（那是保护，不是缺陷）
+    no_ai = ("岗位职责\n"
+             "1. 负责产品规划、需求文档与原型设计，推动跨团队协作落地，跟进版本规划与上线迭代。\n"
+             "2. 梳理业务流程，输出产品方案，参与用户调研与数据分析，沉淀指标体系，支撑运营决策。\n"
+             "3. 负责商业化路径设计、定价策略与付费转化提升，推动营收增长。\n"
+             "4. 协调研发、设计、运营等干系人，保障交付落地与灰度发布。\n"
+             "任职要求\n"
+             "1. 本科及以上学历，3 年以上产品经理经验。\n"
+             "2. 熟悉 B 端 SaaS 产品，具备解决方案设计与客户沟通能力。\n"
+             "3. 具备较强的数据分析能力、跨部门协同与项目推动能力。\n"
+             "4. 熟悉产品全生命周期管理，具备从 0 到 1 的产品设计经验。\n"
+             "5. 具备良好的沟通表达与文档撰写能力，能独立推进项目。\n"
+             "工作地点：上海")
+    verdict, findings = M.hard_gate(no_ai)
+    joined = "\n".join(findings)
+    check("通篇无 AI 词 → 红档排除", verdict == "red", f"verdict={verdict}")
+    check("红档说明落在「排除条件②」", "🔴 排除条件②" in joined, joined)
+
+    with_ai = ("岗位职责\n负责大模型应用产品设计，熟悉 RAG 与 Agent 编排。\n"
+               "任职要求\n本科及以上学历，3 年以上产品经理经验。\n工作地点：上海")
+    _, findings_ai = M.hard_gate(with_ai)
+    joined_ai = "\n".join(findings_ai)
+    check("检出 AI 含量 → 不因②封红", "🔴 排除条件②" not in joined_ai, joined_ai)
+    check("输出 AI 含量证据", "🟢 排除条件②" in joined_ai, joined_ai)
+
+    # 截断 JD：AI 词可能随残文一起丢 → 不得把「没读到」当成「没有」
+    trunc = ("岗位职责\n负责产品规划与需求文档。\n任职要求\n熟悉平台类产品设计流程。\n"
+             + "熟悉产品设计流程。" * 40 + "\n（快照在此截断，任职要求原文未抓全）")
+    verdict_t, findings_t = M.hard_gate(trunc)
+    joined_t = "\n".join(findings_t)
+    check("截断且无 AI 词 → 降级黄档而非封红",
+          verdict_t != "red" and "🟡 排除条件②" in joined_t,
+          f"verdict={verdict_t}｜{joined_t}")
+
+
+def test_meta_strip():
+    """jd_body 必须剥离摘录头部的入库元数据（2026-09-11 实测：抓取管道元数据
+    「来源：猎聘 MCP 主动搜索」被当成 JD 正文 → 凭空多出「MCP 协议」技能点）。"""
+    print("— test_meta_strip（元数据剥离）")
+    meta = ("<!-- MATCHMETA tier=green score=42.2 company=X title=Y -->\n"
+            "# X ｜ Y\n\n"
+            "- **投递入口**：[点击投递](https://www.liepin.com/job/1.shtml)\n"
+            "- **薪资**：50-60k·15薪\n"
+            "- **来源**：猎聘 MCP 主动搜索（keyword=AI产品经理）\n"
+            "- **URL**：https://www.liepin.com/job/1.shtml\n\n---\n\n"
+            "职位介绍 \n 负责AI客服产品的规划与落地。\n")
+    body = M.jd_body(meta)
+    check("元数据行已剥离（无「投递入口」）", "投递入口" not in body, body[:80])
+    check("元数据行已剥离（无「来源」）", "**来源**" not in body, body[:80])
+    check("JD 正文保留", "负责AI客服产品" in body, body[:80])
+    check("标题行已剥离", body.lstrip().startswith("职位介绍"), body[:40])
+
+    # 真实 JD 里出现「- **薪资**：面议」这类内容不得误伤（只剥引导块）
+    real = "岗位职责\n- **薪资**：面议，具体面谈\n负责产品规划。\n任职要求\n3年以上经验。"
+    body2 = M.jd_body(real)
+    check("正文中段的同类行不受影响", "**薪资**：面议" in body2, body2[:80])
+
+
+def test_city_rule():
+    """规则5城市判定：元数据/正文显式工作地才算，裸城市词与猎聘页面标题不算。"""
+    import match_jd as M
+    jd_body = ("岗位职责\n负责大模型产品规划，推动跨团队协作落地。\n"
+               "任职要求\n本科及以上学历，3 年以上产品经验，熟悉 Agent 编排。"
+               "有金融风控场景经验优先。能够承受快节奏工作。")
+    # ① 正文显式「工作地点：宁波」→ 红
+    v, f = M.hard_gate(jd_body + "工作地点：宁波-高新区", "")
+    assert v == "red" and any("工作城市非上海" in x for x in f), (v, f)
+    # ② 「工作地点宁波市」无冒号紧邻写法（宁波银行官方简章原文）→ 红
+    v, f = M.hard_gate(jd_body + "工作地点宁波市，截止时间2026-12-31", "")
+    assert v == "red", (v, f)
+    # ③ 元数据干净地点 → 红；④ 猎聘页面标题假地点（搜索词城市）→ 不算
+    meta = "- **投递入口**：x\n- **地点**：宁波-福明\n- **薪资**：25-40k"
+    v, _ = M.hard_gate(jd_body, meta)
+    assert v == "red", v
+    meta_fake = "- **地点**：【上海 大模型产品经理招聘】-宁波银行上海招聘信息-猎聘"
+    v, _ = M.hard_gate(jd_body, meta_fake)
+    assert v != "red", v
+    # ⑤ 裸城市词（分支描述「在深圳设有分支机构」）→ 不算，防众安类误报
+    v, _ = M.hard_gate(jd_body + "公司在深圳设有分支机构。", "")
+    assert v != "red", v
+    # ⑥ 「宁波银行」公司名自带城市名 → 不算（正文中无其他工作地证据）
+    v, _ = M.hard_gate("宁波银行总行 金融科技部。" + jd_body, "")
+    assert v != "red", v
+    # ⑦ 正文写明上海 → 通过
+    v, _ = M.hard_gate(jd_body + "工作地点：上海市浦东新区", "")
+    assert v != "red", v
+    # ⑧ 支持远程豁免
+    v, _ = M.hard_gate(jd_body + "工作地点：宁波（支持远程）", "")
+    assert v != "red", v
+    print("  ✅ 城市规则 8 条（显式工作地才算 / 页面标题与裸城市词不算 / 远程豁免）")
+
+
+def test_rule6_title_scope():
+    """规则6判据范围：岗位名里的 AI 字样也算 AI 含量（防「AI Infra PM」类误杀）。"""
+    import match_jd as M
+    jd_body = ("岗位职责\n1.负责推理平台的产品规划与功能设计，制定迭代路线图；\n"
+               "2.跟踪性能、稳定性和模型兼容性的持续改进，与研发团队协作推动方案落地；\n"
+               "3.深入理解客户在模型服务化场景下的痛点，输出解决方案与产品文档。\n"
+               "任职要求\n1. 3 年以上后端平台、基础设施或技术产品经验；\n"
+               "2. 理解队列、并发、调度等系统概念，能与算法团队顺畅协作；\n"
+               "3. 具备良好的跨团队沟通能力与文档能力，对平台型产品有热情。\n"
+               "加分项\n有云平台或开源社区贡献经验者优先，能承受快节奏工作。\n"
+               "我们提供有竞争力的薪酬与期权激励，团队氛围开放，重视工程师文化与产品思维，"
+               "欢迎对基础软件有长期投入意愿的伙伴加入，一起打磨服务于企业客户的核心平台产品。")
+    # ① 岗位名带 AI、正文无 AI 词 → 不封红（2026-09-11 修）
+    v, f = M.hard_gate(jd_body, title="AI Infra PM/推理平台产品经理")
+    assert v != "red", (v, [x for x in f if "②" in x])
+    # ② 岗位名和正文都没有 AI 词 → 仍封红
+    v, _ = M.hard_gate(jd_body, title="高级产品经理")
+    assert v == "red", v
+    # ③ 正文带 AI 词 → 不封红（原有行为不回归）
+    v, _ = M.hard_gate(jd_body + "熟悉大模型推理服务与效果评测体系。", title="高级产品经理")
+    assert v != "red", v
+    print("  ✅ 规则6范围 3 条（岗位名 AI 字样计入判据 / 全无才封红）")
+
+
 def main():
     print("=" * 68)
     print("P1/P2 防回归自检 ｜ 每条断言对应一个已修 bug")
     print("=" * 68)
     for fn in (test_vocab_keys, test_word_boundary, test_ab_forms, test_pref_clause_split,
-               test_body_scope, test_html_to_jd, test_completeness):
+               test_body_scope, test_html_to_jd, test_completeness, test_ai_content_gate,
+               test_meta_strip, test_city_rule, test_rule6_title_scope):
         fn()
     print("\n" + "=" * 68)
     if FAILURES:
