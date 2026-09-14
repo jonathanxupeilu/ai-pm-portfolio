@@ -15,11 +15,15 @@ rank_pool.py — 生成 jd-pool/RANKED_LIST.md 排序推荐 list
      - --no-link-check 关闭校验（离线/省时用）
   4. 时效：采集日距今 ≥30 天 → 标「待复核」；≥60 天由 cleanup_pool.py 归档
   5. red 档不进 list，只报计数（防重复研究同一个坑）
+  6. 已投递排除（2026-09-14 新增）：读**投递台账 pipeline.csv**，状态 ∈ NOT_RECOMMEND_STATES
+     的岗位从推荐排序剔除、单列「✅ 已投递 · 不再推荐」一节（用户要求「投过的别再推荐」）。
+     判定源刻意选台账而非 MATCHMETA —— 加 META 字段会打断下游按尾部锚定的正则。
 铁律：分数只是排序依据，投递决策以三档结论 + 人工判断为准；
      链接失效 ≠ 岗位失效，JD 原文摘录才是匹配依据。
 """
 import re
 import sys
+import csv
 import json
 import argparse
 import datetime
@@ -31,6 +35,8 @@ SKILL = pathlib.Path(__file__).resolve().parent.parent
 POOL = SKILL / "jd-pool"
 OUT = POOL / "RANKED_LIST.md"
 CACHE = POOL / ".link_cache.json"
+# 投递台账：**已投递状态的唯一真源**（rank_pool 读它来排除已投岗位，见 NOT_RECOMMEND_STATES）
+PIPELINE = SKILL / "pipeline.csv"
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import match_jd as M  # noqa: E402  （权重唯一真源，用于生成表头文案）
@@ -61,6 +67,100 @@ PURPOSE_ORDER = ["占坑", "练手", "熟流程", "主攻"]
 # （同岗半年冷却）」，投出去会烧掉第一印象。故必须从推荐排序剔除、单列一节。
 # 与 dead 的区别：dead 是岗位失效（客观），不投是策略排除（主观），JD 原文都保留。
 NO_SUBMIT = "不投"
+
+# ── 已投递排除（2026-09-14 新增，用户要求「投过的别再推荐」）─────────────────
+# 判定源是**投递台账 pipeline.csv**，不是 MATCHMETA。
+# 为什么不在 MATCHMETA 里加 `status=applied`：
+#   2026-09-14 刚发生过「给备注加字段 → 下游按尾部锚定的正则整条失配 →
+#   清理脚本差点把全池 115 个岗位归档」的事故。台账本来就是投递状态的唯一真源，
+#   榜单直接读它即可 —— 零字段变更、零正则连锁风险。
+# 判定：台账「状态」列 ∈ 下面集合 → 从「推荐投递排序」剔除，单列「✅ 已投递」一节。
+#   「待投」与空值**不排除**（还没投出去，照常推荐）。
+NOT_RECOMMEND_STATES = ("已投", "已读", "约面", "挂", "别投")
+STATUS_ICON = {"待投": "🕗", "已投": "📤", "已读": "👀", "约面": "🎯", "挂": "💀", "别投": "🚫"}
+
+
+def _ct_key(company: str, title: str) -> str:
+    """公司+岗位的比对键（URL 匹配的兜底）：只归一化空白与全/半角括号、斜杠。
+
+    **刻意不做大小写归一** —— 2026-09-14 实测踩坑：`AI agent产品经理` 与
+    `AI Agent产品经理` 看似同一个，实为**两个不同岗位**（URL 分别是
+    `/a/79448235` 与 `/a/79611815`，任职要求也不同：前者 2-5 年 AI 产品经验，
+    后者 3 年产品经理 + 多模态/内容创作工具）。大小写归一会让它们撞成同一个键，
+    把用户**没投过**的那个也误排掉。
+    按本技能铁律「**宁可漏检，不可误杀**」：误排一个没投的岗比漏排更糟，故保持大小写敏感。
+
+    为什么要去掉空白：同一岗位在两个站点上标题会差一个空格
+    （`金融AI产品经理 / 智能体工程师` vs `金融AI产品经理/智能体工程师`）。
+    """
+    s = f"{company}|{title}".replace("（", "(").replace("）", ")").replace("／", "/")
+    return re.sub(r"\s+", "", s)
+
+
+def load_applied() -> dict:
+    """读投递台账，返回已投递索引：`{('url', 规范URL) / ('ct', 公司|岗位): 记录}`。
+
+    列名按**关键字**匹配，不按位置 —— 台账列名自带括号说明
+    （`状态(待投/已投/已读/约面/挂/别投)`），位置读法一旦改了列序就会静默读错列。
+    记录里带 `row`（原文件行号，1 起，表头为 1）用于回报「对不上号」的行。
+    """
+    if not PIPELINE.exists():
+        return {}
+    try:
+        with PIPELINE.open(encoding="utf-8-sig", newline="") as fh:
+            rows = list(csv.reader(fh))
+    except OSError:
+        return {}
+    if len(rows) < 2:
+        return {}
+    header = rows[0]
+
+    def col(*keys):
+        for i, h in enumerate(header):
+            if any(k in h for k in keys):
+                return i
+        return None
+
+    c_co, c_ti = col("公司"), col("岗位")
+    c_url, c_date = col("链接"), col("投递日")
+    c_st, c_next = col("状态"), col("下次跟进", "跟进日")
+    if c_co is None or c_ti is None or c_st is None:
+        return {}
+
+    def cell(row, i):
+        return (row[i] if i is not None and i < len(row) else "").strip()
+
+    out = {}
+    for lineno, row in enumerate(rows[1:], start=2):
+        status = cell(row, c_st)
+        if status not in NOT_RECOMMEND_STATES:
+            continue
+        co, ti = cell(row, c_co), cell(row, c_ti)
+        url = cell(row, c_url)
+        # 跳过仓库自带的「示例科技有限公司」示例行：它的状态列写着「已投」，
+        # 但岗位池里没有对应档案 → 会在每一轮跑榜时误报「台账对不上号」。
+        # 这是模板自带的演示数据，不是真投递，故在代码里挡掉（不删用户的台账数据）。
+        if "示例" in co or "示例" in ti:
+            continue
+        rec = {"status": status, "date": cell(row, c_date), "next": cell(row, c_next),
+               "row": lineno, "company": co, "title": ti}
+        if url and url not in ("none", "-", "—"):
+            out[("url", normalize_url(url))] = rec
+        if co and ti:
+            out[("ct", _ct_key(co, ti))] = rec
+    return out
+
+
+def find_applied(row: dict, applied: dict):
+    """判断池内某岗位是否已投递。URL 优先（同岗换站点也认得出），公司+岗位兜底。"""
+    if not applied:
+        return None
+    url = (row.get("url") or "").strip()
+    if url and url != "none":
+        rec = applied.get(("url", normalize_url(url)))
+        if rec:
+            return rec
+    return applied.get(("ct", _ct_key(row["company"], row["title"])))
 
 
 def load_strategy_note() -> str:
@@ -327,8 +427,24 @@ def main():
     # 同时剔除 purpose=不投 的岗（策略排除，非失效）——否则 🟢 档的不投岗会混在推荐位里
     dead_rows = [r for r in rows if r["mark"] == "dead"]
     nosubmit_rows = [r for r in rows if r["mark"] != "dead" and r["purpose"] == NO_SUBMIT]
-    active = [r for r in rows
-              if r["mark"] != "dead" and r["purpose"] != NO_SUBMIT]
+    # 已投递的岗位不再进推荐排序（2026-09-14 用户要求「投过的别再推荐」）。
+    # 判定源：投递台账 pipeline.csv，**不是 MATCHMETA**（避免加字段引发正则连锁失配）。
+    applied_idx = load_applied()
+    applied_rows, active = [], []
+    for r in rows:
+        if r["mark"] == "dead" or r["purpose"] == NO_SUBMIT:
+            continue
+        rec = find_applied(r, applied_idx)
+        if rec:
+            r["applied"] = rec
+            applied_rows.append(r)
+        else:
+            active.append(r)
+    # 台账里标了已投递、却在池里找不到对应档案的行 —— 必须报出来，
+    # 否则「已投递」会静默变成「没投过」，下次又把同一个岗推给你。
+    matched_linenos = {r["applied"]["row"] for r in applied_rows}
+    all_linenos = {rec["row"] for rec in applied_idx.values()}
+    orphan_linenos = sorted(all_linenos - matched_linenos)
 
     lines = [
         "# JD 排序推荐 List",
@@ -345,6 +461,10 @@ def main():
         f"> {load_strategy_note()}",
         f"> 轮次列取值：`占坑` / `练手` / `熟流程` / `主攻`（来自 strategy.md）｜"
         f"**`{NO_SUBMIT}`** = 策略性排除（真目标大厂的非点名岗，不进推荐排序）｜`—` = 未标注。",
+        f"> **✅ 已投递排除（2026-09-14 新增，用户要求「投过的别再推荐」）**：判定源是投递台账 "
+        f"`{PIPELINE.name}`，状态 = " + " / ".join(f"`{s}`" for s in NOT_RECOMMEND_STATES) +
+        " 的岗位**从推荐排序剔除**、单列「✅ 已投递」一节；`待投`与空状态不排除。"
+        "**改判请改台账那一行的状态列，不要动 MATCHMETA**（加字段会打断下游正则）。",
         "> 分数只是排序依据，投递决策以三档结论 + 人工判断为准；red 档不进本 list。",
         "> 链接列：🔗 页面可访问（正文已读到、无下线标识）｜ ❔ 需人工点开确认（空壳页或未实测站点，正文读不到）｜ ❌ 已结束 ｜ ⚠️ 疑似失效 ｜ ❓ 站点拒绝校验（反爬，不算失效）｜ ⬜ 未校验（跑了 --no-link-check）。",
         "> **岗位状态校验的能力边界（2026-09-10 重写）**：能自动判定 **已结束/下线**——① HTTP 404/410；② GET 正文命中岗位下线词（已结束/已下线/停止招聘等）。为此做了三件事：**URL 域名规范化**（`m.quanzhi.com` 空壳域名 → `www.` 可读域名）、**对所有站点都扫正文**（旧版对 SPA 站直接跳过 = 漏检根因）、**读足量字节**（旧版读 20000 字节，而「已结束」实际出现在 17810~28227 字节不等，会静默漏检）。",
@@ -403,6 +523,39 @@ def main():
     else:
         lines.append("_池子是空的——用 match_jd.py --save 入库第一批 JD 后重跑本脚本。_")
 
+    if applied_rows:
+        lines += [
+            "", f"## ✅ 已投递 · 不再推荐（{len(applied_rows)} 个）", "",
+            "> **投过的岗位不再出现在上面的推荐排序里**——重复推荐等于白推。"
+            f"判定源是投递台账 `{PIPELINE.name}`（已投递状态的唯一真源），"
+            "判定条件：「状态」列 = " + " / ".join(f"`{s}`" for s in NOT_RECOMMEND_STATES) + "。",
+            "> 「**待投**」与空状态**不排除**（还没投出去，照常进推荐）。"
+            "JD 原文保留在池内，供复盘、面试准备与组版语料复用。"
+            "**想改判** → 直接改台账那一行的状态列，重跑本脚本即可（不要动 MATCHMETA）。",
+            "",
+            "| 匹配分 | 档位 | 轮次 | 公司 / 岗位 | 投递链接 | 投递日 | 状态 | 下次跟进 | 详情文件 |",
+            "|---|---|---|---|---|---|---|---|---|",
+        ]
+        for r in applied_rows:
+            a = r["applied"]
+            pur = r["purpose"] if r["purpose"] else "—"
+            st = f"{STATUS_ICON.get(a['status'], '')} {a['status']}".strip()
+            if r["url"] and r["url"] != "none":
+                cell = f"[🔗 原岗位]({normalize_url(r['url'])})"
+            else:
+                cell = "⚠️ 无链接"
+            lines.append(
+                f"| {r['score']} | {TIER_ICON[r['tier']]} | {pur} | {r['company']} / {r['title']} "
+                f"| {cell} | {a['date'] or '—'} | {st} | {a['next'] or '—'} | {r['file']} |"
+            )
+        if orphan_linenos:
+            lines += [
+                "",
+                f"> ⚠️ **台账里标了已投递、但在岗位池找不到对应档案的行**：{'、'.join(str(x) for x in orphan_linenos)}。"
+                "多半是公司名/岗位名写法不同，或该档案已被 `cleanup_pool.py` 归档。"
+                "**这些岗位不受排除保护，可能被再次推荐** → 请核对台账写法。",
+            ]
+
     if dead_rows:
         lines += [
             "", f"## ⛔ 已结束 / 不可投递（{len(dead_rows)} 个）", "",
@@ -446,8 +599,10 @@ def main():
     lines += ["", "---", f"🔴 red 档黑名单：{red_count} 个（别投的坑，长期保留防重复研究，不进排序）。", ""]
     OUT.write_text("\n".join(lines), encoding="utf-8")
     print(f"💾 已生成 {OUT}")
-    print(f"   推荐投递 {len(active)} ｜ 已结束剔除 {len(dead_rows)} ｜ 策略排除(不投) {len(nosubmit_rows)} "
-          f"｜ 待补分 {len(legacy)} ｜ red 黑名单 {red_count}")
+    print(f"   推荐投递 {len(active)} ｜ 已投递排除 {len(applied_rows)} ｜ 已结束剔除 {len(dead_rows)} "
+          f"｜ 策略排除(不投) {len(nosubmit_rows)} ｜ 待补分 {len(legacy)} ｜ red 黑名单 {red_count}")
+    if orphan_linenos:
+        print(f"   ⚠️ 台账第 {orphan_linenos} 行标了已投递但池内无对应档案 —— 这些岗可能被再次推荐，请核对写法")
     if not args.no_link_check:
         ok = len(rows) - dead - suspect - unknown - spa
         print(f"   链接校验：可访问 {ok} ｜ 待人工确认(SPA) {spa} ｜ 已结束 {dead} ｜ 疑似 {suspect} ｜ 未确认 {unknown}")

@@ -27,9 +27,16 @@ SKILL = pathlib.Path(__file__).resolve().parent.parent
 POOL = SKILL / "jd-pool"
 ARCHIVE = POOL / "archive"
 
+# ⚠️ 尾部必须带 `(?:\s+\w+=\S+)*` 兜住扩展字段（purpose / mode / hit / must /
+#    truncated / patched / manual / status …）。写死「url 是最后一个字段」会让整条
+#    正则失配，全部文件落进 no_meta 兜底分支（日期默认 1970-01-01），
+#    于是每个岗位都被算成「采集于 20710 天前」→ 一跑 --apply 就把整个池子归档。
+#    2026-09-14 实跑踩到（dry-run 预览 115/115 全量归档才发现）。
+#    写法与 rank_pool.META_PAT 保持一致。
 META_PAT = re.compile(
     r"<!--\s*MATCHMETA\s+tier=(\w+)\s+score=([\d.]+)\s+coverage=(\S+)\s+"
-    r"company=(.+?)\s+title=(.+?)\s+date=(\S+)\s+source=(\S+?)(?:\s+url=(\S+?))?\s*-->"
+    r"company=(.+?)\s+title=(.+?)\s+date=(\S+)\s+source=(\S+?)"
+    r"(?:\s+url=(\S+?))?(?:\s+\w+=\S+)*\s*-->"
 )
 
 
@@ -90,9 +97,18 @@ def main():
         return
 
     logs, kept = [], []
+    meta_missing = []
     # 规则1：过时（red 不参与）
     for tier in ("green", "yellow"):
         for r in pool[tier]:
+            if r.get("no_meta"):
+                # 🛡️ 元数据缺失 → **不判定采集日，绝不按「过时」归档**。
+                # 危险动作不能建立在兜底默认值上：正则一旦失配，兜底日期 1970-01-01
+                # 会让整池被判「过期 2 万天」，一跑 --apply 就把池子清空。
+                # 正确做法是留在池子里、显式报警，交人工查 MATCHMETA 格式。
+                meta_missing.append(r)
+                kept.append(r)
+                continue
             a = age_days(r["date"], today)
             if a > args.stale_days:
                 logs.append(archive(r["file"], today, f"采集于 {a} 天前，超过 {args.stale_days} 天", args.apply))
@@ -121,6 +137,15 @@ def main():
     print("=" * 62)
     print(f"\n当前库存：🟢{len(pool['green'])} 🟡{len(pool['yellow'])} 🔴{len(pool['red'])}")
     print(f"过期阈值：> {args.stale_days} 天（red 黑名单不受时效影响，长期保留）")
+    if meta_missing:
+        print(f"\n⚠️ 元数据缺失 {len(meta_missing)} 份 —— 读不到 MATCHMETA，**无法判定采集日，本轮跳过时效清理**。")
+        print("   请检查这些文件的 META 行格式（正常形如 `<!-- MATCHMETA tier=… date=YYYY-MM-DD … -->`）：")
+        for r in meta_missing[:8]:
+            print(f"     · {r['file'].name}")
+        if len(meta_missing) > 8:
+            print(f"     … 另有 {len(meta_missing) - 8} 份")
+        if len(meta_missing) >= 0.5 * max(1, len(pool['green']) + len(pool['yellow'])):
+            print("   🚨 缺失比例过半 —— 大概率是 META 正则失配（而非个别文件损坏），先修脚本再清理。")
     if logs:
         print(f"\n【清理项 {len(logs)} 条】")
         for l in logs:

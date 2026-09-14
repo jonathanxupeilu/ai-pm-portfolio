@@ -294,13 +294,101 @@ def test_rule6_title_scope():
     print("  ✅ 规则6范围 3 条（岗位名 AI 字样计入判据 / 全无才封红）")
 
 
+def test_applied_exclusion():
+    """已投递排除（2026-09-14 新增）：台账里状态为「已投/已读/约面/挂/别投」的岗位
+    必须从推荐排序剔除 —— 用户要求「投递过的就别再给我推荐了」。
+
+    为什么要有这条断言：判定链路上有三个**静默**失效点，全都不会报错，只会悄悄排错。
+      ① 台账列名自带括号说明（`状态(待投/已投/…)`），按**位置**读列一旦改了列序就静默读错列；
+      ② 公司+岗位比对键若做**大小写归一**，`AI agent产品经理` 与 `AI Agent产品经理` 会撞成
+         同一个键 —— 2026-09-14 实测这俩是**两个不同岗位**（`/a/79448235` 要求 2-5 年 AI 产品
+         经验；`/a/79611815` 要求 3 年产品经理 + 多模态/内容创作工具），归一会把用户
+         **没投过**的那个也误排掉（当时已误排，改成大小写敏感才修好）；
+      ③ 仓库自带的「示例科技有限公司」示例行状态列写着「已投」，不挡掉每轮都会误报
+         「台账有已投递行在池里找不到档案」。
+    """
+    import csv as _csv
+    import shutil
+    import tempfile
+    import rank_pool as R
+    print("— test_applied_exclusion（已投递不再推荐）")
+
+    # ① 比对键：空白差异要等价（同一岗位挂两个站点，标题会差一个空格）
+    check("比对键忽略空白差异",
+          R._ct_key("某咨询公司", "金融AI产品经理 / 智能体工程师")
+          == R._ct_key("某咨询公司", "金融AI产品经理/智能体工程师"))
+    # ② 比对键：大小写必须敏感（否则同名不同岗被误杀）
+    check("比对键保持大小写敏感（防误杀同名不同岗）",
+          R._ct_key("某知名公司", "AI agent产品经理")
+          != R._ct_key("某知名公司", "AI Agent产品经理"))
+
+    # ③ 用真台账的表头结构测状态判定
+    header = ["公司", "岗位", "JD链接", "档位(green/yellow/red)", "投递日", "版本文件",
+              "本版改了什么", "状态(待投/已投/已读/约面/挂/别投)", "下次跟进日", "复盘备注"]
+
+    def row(co, ti, url, st):
+        return [co, ti, url, "green", "2026-09-14", "x", "x", st, "2026-09-21", "t"]
+
+    tmpdir = Path(tempfile.mkdtemp())
+    tmp = tmpdir / "pipeline.csv"
+    with tmp.open("w", encoding="utf-8-sig", newline="") as fh:
+        _csv.writer(fh).writerows([
+            header,
+            row("甲", "已投岗", "https://www.liepin.com/job/1.shtml", "已投"),
+            row("乙", "待投岗", "https://www.liepin.com/job/2.shtml", "待投"),
+            row("丙", "挂掉岗", "https://www.liepin.com/job/3.shtml", "挂"),
+            row("示例科技有限公司", "示例岗", "https://example.com/jobs/1001", "已投"),
+        ])
+    orig = R.PIPELINE
+    R.PIPELINE = tmp
+    try:
+        idx = R.load_applied()
+    finally:
+        R.PIPELINE = orig
+    shutil.rmtree(tmpdir, ignore_errors=True)
+
+    check("已投 → 进排除索引", ("url", "https://www.liepin.com/job/1.shtml") in idx)
+    check("挂 → 也进排除索引（不再推荐）", ("url", "https://www.liepin.com/job/3.shtml") in idx)
+    check("待投 → 不进排除索引（仍要推荐）",
+          ("url", "https://www.liepin.com/job/2.shtml") not in idx)
+    check("仓库自带的示例行被挡掉（不误报「对不上号」）",
+          ("url", "https://example.com/jobs/1001") not in idx)
+
+    # ④ 池内档案：URL 优先；URL 缺失时公司+岗位兜底；没投过的绝不能排除
+    check("池内岗位按 URL 命中",
+          R.find_applied({"company": "丁", "title": "别的名",
+                          "url": "https://www.liepin.com/job/1.shtml"}, idx) is not None)
+    check("URL 缺失时靠公司+岗位兜底命中",
+          R.find_applied({"company": "甲", "title": "已投岗", "url": ""}, idx) is not None)
+    check("没投过的岗不得被排除",
+          R.find_applied({"company": "戊", "title": "新岗",
+                          "url": "https://www.liepin.com/job/9.shtml"}, idx) is None)
+
+    # ⑤ 本机真台账：必须能读出「状态」列，且已投递行都解析出了键（防列名漂移）
+    with R.PIPELINE.open(encoding="utf-8-sig", newline="") as fh:
+        raw = list(_csv.reader(fh))
+    si = next((i for i, h in enumerate(raw[0]) if "状态" in h), None)
+    if si is None:
+        check("本机台账有「状态」列", False, "列名漂移：找不到状态列，已投递排除会整体失效")
+    else:
+        n_applied = sum(1 for r in raw[1:]
+                        if len(r) > si and r[si].strip() in R.NOT_RECOMMEND_STATES
+                        and "示例" not in r[0])
+        real = R.load_applied()
+        n_url = len([k for k in real if k[0] == "url"])
+        check("本机台账的已投递行都解析出了键（防列名漂移）",
+              n_applied == 0 or n_url >= n_applied,
+              f"台账已投递 {n_applied} 行 → 只解析出 {n_url} 个 URL 键")
+
+
 def main():
     print("=" * 68)
     print("P1/P2 防回归自检 ｜ 每条断言对应一个已修 bug")
     print("=" * 68)
     for fn in (test_vocab_keys, test_word_boundary, test_ab_forms, test_pref_clause_split,
                test_body_scope, test_html_to_jd, test_completeness, test_ai_content_gate,
-               test_meta_strip, test_city_rule, test_rule6_title_scope):
+               test_meta_strip, test_city_rule, test_rule6_title_scope,
+               test_applied_exclusion):
         fn()
     print("\n" + "=" * 68)
     if FAILURES:
