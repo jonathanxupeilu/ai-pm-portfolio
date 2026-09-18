@@ -381,6 +381,232 @@ def test_applied_exclusion():
               f"台账已投递 {n_applied} 行 → 只解析出 {n_url} 个 URL 键")
 
 
+# ── 13. shown 台账：展示过的不再推（去重层②）──────────────────────────────
+def test_shown_log():
+    """find_jobs 的「以前展示过的岗位不能再推」全靠这张台账。
+    三个静默失效点：① 追加时再写 BOM 会毒化续写行首列；② 幂等失效会把台账灌爆，
+    下次跑的键索引出现同日多份互相矛盾的记录；③ ct 键大小写归一 → 误杀没推过的岗。"""
+    import csv as _csv
+    import tempfile
+    import pathlib
+    import datetime
+    import rank_pool as R
+    import find_jobs as F
+    print("— test_shown_log（展示过不再推）")
+
+    d = pathlib.Path(tempfile.mkdtemp())
+    log = d / "shown_log.csv"
+    check("台账不存在 → 空索引（首轮找岗不被历史挡）", F.load_shown_log(log) == {})
+
+    today = datetime.date(2026, 9, 17)
+    rows = [{"company": "甲公司", "title": "AI产品经理", "url": "https://www.liepin.com/job/111.shtml",
+             "jobId": "111", "purpose": "占坑"}]
+    n1 = F.append_shown_log(rows, today, "短名单_20260917.md", path=log)
+    n2 = F.append_shown_log(rows, today, "短名单_20260917.md", path=log)  # 幂等：同键不重复写
+    check("append 写入 1 行且重复调用幂等", (n1, n2) == (1, 0), f"{n1},{n2}")
+
+    raw = log.read_bytes()
+    check("BOM 只出现在文件头一次（追加不得再吐 BOM）",
+          raw.count(b"\xef\xbb\xbf") == 1)
+
+    idx = F.load_shown_log(log)
+    check("jobId 键命中", F.is_shown({"jobId": "111"}, idx) is not None)
+    check("URL 键命中（经规范化）",
+          F.is_shown({"url": "https://www.liepin.com/job/111.shtml"}, idx) is not None)
+    check("公司+岗位 兜底命中",
+          F.is_shown({"company": "甲公司", "title": "AI产品经理"}, idx) is not None)
+    check("大小写不同的岗位不得被误判已展示",
+          F.is_shown({"company": "甲公司", "title": "AI Agent产品经理"}, idx) is None)
+
+
+# ── 14. 轮次解析：strategy.md §一 → 当前轮（解析不出必须问，不臆测）──────────
+def test_round_parse():
+    import tempfile
+    import pathlib
+    import find_jobs as F
+    print("— test_round_parse（轮次解析）")
+
+    d = pathlib.Path(tempfile.mkdtemp())
+
+    def w(name, txt):
+        p = d / name
+        p.write_text(txt, encoding="utf-8")
+        return p
+
+    p = w("a.md", "# 策略\n<!-- CURRENT_ROUND: 主攻 -->\n| 当前轮次 | **占坑 + 练手（并行）** |\n")
+    r, ev = F.parse_current_round(p)
+    check("机器标记行最优先（压过 prose）", r == ["主攻"], ev)
+
+    p = w("b.md", "## 一、当前所处轮次\n当前轮次：**占坑 + 练手（并行）**\n## 二、全表\n占坑 练手 熟流程 主攻\n")
+    r, ev = F.parse_current_round(p)
+    check("prose 提取占坑+练手，且小节止于下一个 ##", r == ["占坑", "练手"], ev)
+
+    p = w("c.md", "## 一、当前所处轮次\n| 占坑 | 练手 | 熟流程 | 主攻 |\n")
+    r, ev = F.parse_current_round(p)
+    check("一段命中≥3个轮次名 → 判不可信（抓到全表）", r == [], ev)
+
+    r, ev = F.parse_current_round(d / "not_exist.md")
+    check("文件不存在 → 空轮次（调用方必须问用户）", r == [] and "不存在" in ev, ev)
+
+    check("--round 含未知轮次 → 拒绝执行(exit 2)", F.main(["--round", "占坑,划水"]) == 2)
+
+
+# ── 15. 选15：过滤 + 新岗优先 + 不凑数 ──────────────────────────────────────
+def test_select_candidates():
+    import rank_pool as R
+    import find_jobs as F
+    print("— test_select_candidates（轮次过滤与凑数纪律）")
+
+    def prow(co, ti, score, purpose="占坑", tier="green", dead=False, url=None):
+        return {"tier": tier, "score": score, "date": "2026-09-17", "company": co,
+                "title": ti, "url": url or f"https://www.liepin.com/job/{co}.shtml",
+                "purpose": purpose, "dead": dead, "file": f"x/{co}.md"}
+
+    pool = [
+        prow("G1", "岗一", 90),
+        prow("G2", "岗二", 80),
+        prow("G3", "岗三", 70),
+        prow("Y1", "黄档", 95, tier="yellow"),          # 🟡 不得进
+        prow("D1", "已死", 99, dead=True),               # dead 不得进
+        prow("N1", "不投", 98, purpose=R.NO_SUBMIT),     # 策略排除不得进
+        prow("U1", "他轮", 97, purpose="主攻"),          # 非当前轮不得进
+        prow("S1", "已展示", 96),                        # shown 挡掉并计数
+        prow("A1", "已投", 91),                          # 台账挡掉
+        prow("F1", "未标注新岗", 60, purpose=""),        # 本轮新采 → 免轮次标注
+    ]
+    shown = {("ct", R._ct_key("S1", "已展示")): {}}
+    applied = {("ct", R._ct_key("A1", "已投")): {"status": "已投"}}
+    fresh = set(F.shown_key_of({"company": "F1", "title": "未标注新岗",
+                                "url": pool[-1]["url"]}))
+
+    picked, n_shown = F.select_candidates(pool, shown, applied, ["占坑", "练手"], fresh, target=15)
+    names = [p["company"] for p in picked]
+    check("🟢∧当前轮通过；🟡/dead/不投/他轮/已投全挡",
+          set(names) >= {"G1", "G2", "G3"} and not ({"Y1", "D1", "N1", "U1", "A1"} & set(names)), names)
+    check("已展示被挡且计数可见（静默排除必须显式）", "S1" not in names and n_shown == 1)
+    check("本轮新采岗免轮次标注（多轮并行时脚本无法替用户归类）", "F1" in names)
+    check("排序：新岗优先，其余按分降序", names[0] == "F1" and names[1] == "G1", names)
+
+    picked, _ = F.select_candidates(pool, {}, {}, ["占坑", "练手"], set(), target=2)
+    check("target 截断生效（凑不满由主流程出 shortfall，不拿🟡凑数）", len(picked) == 2)
+
+    u = "https://www.liepin.com/job/1985512651.shtml"
+    dup = [prow("C1", "岗位旧档案简称", 64, url=u),
+           prow("C1", "岗位新档案全称", 70, url=u)]      # 2026-09-18 字节VOC双行事故形状
+    picked, _ = F.select_candidates(dup, {}, {}, ["占坑"], set(), target=15)
+    check("同一 URL 只留一个岗（旧池重复档案不得与本批新岗并列）",
+          len(picked) == 1 and picked[0]["score"] == 70, [p["score"] for p in picked])
+
+    check("job_id_from_url：/job/ 剥固定页前缀 19，/a/ 原样，非猎聘链接空",
+          F.job_id_from_url("https://www.liepin.com/job/1985512651.shtml") == "85512651"
+          and F.job_id_from_url("https://www.liepin.com/a/79950625.shtml") == "79950625"
+          and F.job_id_from_url("") == "")
+
+
+# ── 16. 批量直投：dry-run 零副作用 + 幂等 + 台账记账 ─────────────────────────
+def test_apply_shortlist():
+    import csv as _csv
+    import tempfile
+    import pathlib
+    import datetime
+    import rank_pool as R
+    import apply_shortlist as A
+    print("— test_apply_shortlist（批量直投护栏）")
+
+    def srow(co, ti, jid="1", jkind="2", url=None):
+        return {"公司": co, "岗位": ti, "jobId": jid, "jobKind": jkind,
+                "URL": url or f"https://www.liepin.com/job/{co}.shtml",
+                "档位": "green", "匹配分": "80", "轮次": "占坑"}
+
+    applied = {("ct", R._ct_key("OLD", "投过")): {"status": "已投"}}
+    planned, skipped = A.plan(
+        [srow("OK", "a"), srow("NOID", "b", jid=""), srow("NOKIND", "c", jkind=""),
+         srow("OLD", "投过"), srow("MAX1", "d"), srow("MAX2", "e"), srow("MAX3", "f")],
+        applied, max_n=3)
+    why = {r["公司"]: w for r, w in skipped}
+    check("planned 只含合格行且保持原序", [r["公司"] for r in planned] == ["OK", "MAX1", "MAX2"],
+          str([r["公司"] for r in planned]))
+    check("已投/缺jobId/缺jobKind 逐个显式跳过（不猜值不静默）",
+          set(why) >= {"NOID", "NOKIND", "OLD"}, str(why))
+    check("单次硬上限 --max 生效（超出行留待下轮且明示）",
+          len(planned) == 3 and "MAX3" in why and "上限" in why["MAX3"], str(why))
+
+    # 实投路径：注入假 apply_fn，绝不真连网
+    calls = []
+
+    def fake_ok(jid, kind):
+        calls.append(jid)
+        return {"code": 0}
+
+    def fake_mixed(jid, kind):
+        calls.append(jid)
+        if jid == "b":
+            raise RuntimeError("boom")
+        if jid == "c":
+            return {"code": 1, "msg": "岗位已下线"}
+        return {"code": 0}
+
+    today = datetime.date(2026, 9, 17)
+    ok, failed = A.run_confirm([srow("K", "k", jid="a")], today, apply_fn=fake_ok)
+    check("成功行入账", ok and not failed)
+    ok, failed = A.run_confirm([srow("K", "k", jid="a"), srow("K", "k", jid="b"),
+                                srow("K", "k2", jid="c")], today, apply_fn=fake_mixed)
+    check("单行异常不炸全批；接口报错码判失败",
+          [r["jobId"] for r in ok] == ["a"] and len(failed) == 2, str(failed))
+
+    def fake_auth(jid, kind):
+        raise A.LC.McpAuthError("401 令牌失效")
+    ok, failed = A.run_confirm([srow("K", f"k{i}", jid=str(i)) for i in range(3)],
+                               today, apply_fn=fake_auth)
+    check("认证失效中断本批且剩余行标未执行（可重跑补投）",
+          not ok and len(failed) == 3 and "未执行" in failed[-1][1])
+
+    # 台账追加：两次 append 只能有一个 BOM；列口径正确
+    d = pathlib.Path(tempfile.mkdtemp())
+    saved, A.PIPELINE = A.PIPELINE, d / "pipeline.csv"
+    try:
+        A.append_pipeline([dict(srow("T1", "t1"), _batch="20260917")], today)
+        A.append_pipeline([dict(srow("T2", "t2"), _batch="20260917")], today)
+        raw = A.PIPELINE.read_bytes()
+        check("pipeline 追加 BOM 只写一次", raw.count(b"\xef\xbb\xbf") == 1)
+        with A.PIPELINE.open(encoding="utf-8-sig", newline="") as fh:
+            recs = list(_csv.DictReader(fh))
+        check("两行都记账且状态/版本口径正确",
+              len(recs) == 2
+              and all(r["状态(待投/已投/已读/约面/挂/别投)"] == "已投" for r in recs)
+              and all(r["版本文件"] == A.VERSION_CELL for r in recs)
+              and "\ufeff" not in "".join(recs[0].values()), str(recs[:1]))
+    finally:
+        A.PIPELINE = saved
+
+
+def test_search_parse():
+    """parse_search_rows 用 2026-09-18 真实 capture 的形状做合成 fixture（不落真数据）。
+    失效模式：字段名换掉/追踪参数不剥 → jobId/url 静默取空，去重与投递全链路失效。"""
+    import liepin_cli as L
+    print("— test_search_parse（猎聘 search 响应解析）")
+    payload = {"code": 0, "data": {"list": [{
+        "jobId": 85698325, "jobType": "2",
+        "jobName": "AI产品经理（合成示例）", "company": "合成公司",
+        "location": "上海-吴泾", "salary": "15-25k·13薪",
+        "companyTags": ["五险一金"],
+        "jobDetailUrl": "https://www.liepin.com/job/1985698325.shtml?mscid=soai_pc_001"}]}}
+    rows = L.parse_search_rows(payload)
+    check("data.list 行被解析出 1 条", len(rows) == 1, str(rows))
+    r = rows[0]
+    check("jobId/jobKind 取自真实字段名（jobId/jobType）",
+          r["jobId"] == "85698325" and r["jobKind"] == "2", str(r))
+    check("jobDetailUrl 命中且追踪参数 mscid 被剥掉",
+          r["url"] == "https://www.liepin.com/job/1985698325.shtml", r["url"])
+    check("title/company/salary 映射正确",
+          r["title"].startswith("AI产品经理") and r["company"] == "合成公司"
+          and r["salary"] == "15-25k·13薪")
+    check("payload 无 description → 空串（正文靠回源抓，不假装抓到）",
+          r["description"] == "")
+    check("形状完全对不上时不崩、返回空列表",
+          L.parse_search_rows({"code": 0, "data": {}}) == [])
+
+
 def main():
     print("=" * 68)
     print("P1/P2 防回归自检 ｜ 每条断言对应一个已修 bug")
@@ -388,7 +614,8 @@ def main():
     for fn in (test_vocab_keys, test_word_boundary, test_ab_forms, test_pref_clause_split,
                test_body_scope, test_html_to_jd, test_completeness, test_ai_content_gate,
                test_meta_strip, test_city_rule, test_rule6_title_scope,
-               test_applied_exclusion):
+               test_applied_exclusion, test_shown_log, test_round_parse,
+               test_select_candidates, test_apply_shortlist, test_search_parse):
         fn()
     print("\n" + "=" * 68)
     if FAILURES:
